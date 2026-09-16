@@ -1,0 +1,1318 @@
+#!/usr/bin/env bash
+# kvmake — run KubeVirt `make` on a remote builder VM.
+# See: kvmake -h
+#
+set -euo pipefail
+
+REMOTE_SIDECAR=".kvmake-run"
+PREFIX_SENTINEL=".kvmake-root"
+TREE_SENTINEL=".kvmake-tree"
+
+# Bind-mounted by hack/dockerized at this absolute host path.
+ABS_FILE_VARS=(
+	BAZEL_CACHE_GOOGLE_CREDENTIALS
+	DOCKER_CA_CERT_FILE
+)
+
+# Read inside the builder after dockerized rsyncs the tree. Must be
+# relative to the remote checkout so the container sees them.
+TREE_FILE_VARS=(
+	COVERALLS_TOKEN_FILE
+	FOSSA_TOKEN_FILE
+)
+
+# Shared by inbound and reverse-sync. --delete does not remove dest files
+# matching these (unless --delete-excluded). .git is copied TO the VM
+# (Bazel workspace_status runs inside dockerized and has no KUBEVIRT_GIT_*
+# env) and is never copied back.
+RSYNC_EXCLUDES=(
+	--exclude=.idea
+	--exclude=.cursor
+	--exclude=.claude
+	--exclude=.vscode
+	--exclude=.history
+	--exclude=bazel-bin
+	--exclude=bazel-genfiles
+	--exclude=bazel-kubevirt
+	--exclude=bazel-out
+	--exclude=bazel-testlogs
+	--exclude=_out
+	--exclude=.vagrant
+	--exclude=.bazeldnf
+	--exclude=_ci-configs
+	--exclude="${REMOTE_SIDECAR}"
+	--exclude=bazel-test
+	--exclude="${TREE_SENTINEL}"
+	--exclude=**/.kubectl
+	--exclude=**/.oc
+	--exclude=**/.kubeconfig
+)
+
+NEED_SYNC_FROM=0
+
+die() {
+	echo "kvmake: $*" >&2
+	exit 1
+}
+
+usage() {
+	cat <<'EOF'
+Usage: kvmake [make arguments...]
+       kvmake reset [-y]
+       kvmake unlock -y
+       kvmake -h|--help
+
+Run KubeVirt's GNU Make on a remote builder VM. Edit on this machine, build
+and test on the VM.
+
+The working directory must be a KubeVirt checkout (or a subdirectory). kvmake
+walks up from $PWD looking for Makefile + hack/dockerized + go.mod module
+kubevirt.io/kubevirt, then always invokes the repo-root Makefile. If that
+root is not found, kvmake exits.
+
+Each invocation:
+  1. rsync the tree to the VM (including .git; excluding caches, IDE dirs, _out)
+  2. ssh (PTY if stdin is a TTY) and exec make with the same arguments
+  3. rsync results back even if make failed or you ^C
+  4. exit with make's status (a reverse-sync failure is reported; it
+     replaces the exit code only when make succeeded)
+
+No arguments is the same as running make with no arguments (the default
+target), not make ''.
+
+Examples:
+  kvmake bazel-build
+  kvmake generate
+  export DOCKER_PREFIX=quay.io/you/kubevirt DOCKER_TAG=mybuild
+  kvmake push
+  export WHAT=pkg/virt-handler
+  kvmake test
+  kvmake functest
+  kvmake reset -y
+
+Config (both files are sourced as bash; environment wins for KVMAKE_*):
+  ~/.config/kvmake.conf
+  <kubevirt-root>/bazel-test/kvmake.conf
+
+  KVMAKE_HOST           required, e.g. user@192.168.1.10
+  KVMAKE_REMOTE_DIR     remote parent prefix (default: ~/kubevirt).
+                        Quote it in config so ~ expands on the VM:
+                          KVMAKE_REMOTE_DIR='~/kubevirt'
+                        Each checkout is a child: $prefix/<id>
+  KVMAKE_SSH_OPTS       extra ssh(1) flags (word-split, not one token)
+  KVMAKE_FORCE_TTY=1    force ssh -tt even when stdin is not a TTY
+  KVMAKE_SKIP_SYNC=1    skip rsync-to-remote (still reverse-syncs)
+  KVMAKE_FORCE_REVERSE=1 reverse-sync even if the laptop tree changed
+                        after the forward rsync
+  KVMAKE_FORWARD_ENV    extra variable names to copy (space-separated).
+                        Use for values consumed indirectly by scripts or for
+                        remote-only client settings which kvmake cannot infer.
+                        Values are interpreted on the VM.
+
+Isolation (two local clones)
+  The id is the KubeVirt repo root (not the subdirectory you ran from),
+  with the leading / stripped and remaining / turned into -. Example:
+
+    /home/user/src/kubevirt
+      → ~/kubevirt/home-user-src-kubevirt
+      → JOB_NAME=kv-<id> (short hash if the name is too long for CRI)
+
+  JOB_NAME is set from that id so hack/dockerized uses a unique CRI
+  volume and *-bazel-server. Two clones can bazel-build at once.
+
+  There is no remote flock. Do not run two kvmake on the same clone
+  (overlapping rsync --delete). Do not reset while another kvmake is
+  running. kubevirtci (cluster-*, functest*, *perftest, conformance,
+  dump) is VM-wide: one at a time, independent of clone. Node names
+  use KUBEVIRT_PROVIDER, not JOB_NAME.
+
+What is sent to the VM
+  The checkout including .git. hack/print-workspace-status.sh runs
+  inside the long-lived bazel-server container; dockerized does not
+  pass KUBEVIRT_GIT_* into that process, so a real gitdir is required.
+  Git worktrees (.git is a file) are refused. Also excludes: .idea,
+  .cursor, .claude, .vscode, bazel-* outputs, _out, .bazeldnf,
+  _ci-configs, bazel-test, sidecar dir, **/.kubeconfig, **/.kubectl,
+  **/.oc. Laptop Docker/Podman/Quay credentials are not copied. Docker uses
+  the VM's ~/.docker/config.json. Podman uses the VM's
+  $XDG_RUNTIME_DIR/containers/auth.json. SSH/sudo often leave
+  XDG_RUNTIME_DIR unset even when linger created /run/user/<uid>; kvmake
+  then exports that directory. podman login may still have written
+  ~/.config/containers/auth.json, which hack/dockerized never mounts.
+  kvmake copies inline auths (not helpers) into both dockerized paths and
+  restarts *-bazel-server when the builder was started without that mount.
+
+What is brought back (always, after every make, including ^C)
+  - The tree with --delete (same excludes), including vendor/.
+    Aborts if remote go.mod is not module kubevirt.io/kubevirt.
+  - Best-effort abort if laptop regular files are newer than the
+    forward rsync, unless KVMAKE_FORCE_REVERSE=1. Does not detect
+    deletions or symlink-only changes. Do not edit the checkout while
+    kvmake is running.
+  - _out/ unless SYNC_OUT=false (environment or make assignment)
+  - ARTIFACTS, if it was an absolute laptop path (also as a make
+    assignment; copy-back is independent of SYNC_OUT)
+
+  Not brought back: .git, IDE dirs, bazel caches, _ci-configs, bazel-test.
+
+  If a dockerized command fails, hack/dockerized copies _out (when
+  SYNC_OUT is true) but does not reverse-sync generated sources from
+  the builder volume. kvmake only reverse-syncs the VM disk, so
+  partial generate/vendor from a failed dockerized run may stay inside
+  the CRI volume and will not come home. This wrapper does not scrape
+  or duplicate dockerized internals.
+
+  generate-verify: after a successful reverse-sync, kvmake runs
+  ./hack/verify-generate.sh locally (the VM .git is a stamp snapshot,
+  not the checkout to verify against).
+
+Env forwarded when set
+  Exported variables referenced as $(NAME) or ${NAME} by KubeVirt's GNU Make
+  database are inferred automatically. Every KUBEVIRT_*, QUAY_*, FUNC_TEST_*,
+  KUBEVIRTCI_* variable and most DOCKER_* variables are also forwarded because
+  scripts may read those namespaces without exposing the names to Make.
+  Dynamically constructed Make references and unnamespaced values read only by
+  scripts cannot be inferred; add them with KVMAKE_FORWARD_ENV.
+  Laptop Docker client state is not auto-forwarded: DOCKER_CONFIG, DOCKER_HOST,
+  DOCKER_CONTEXT, DOCKER_CERT_PATH, DOCKER_TLS, DOCKER_TLS_VERIFY, and
+  DOCKER_AUTH_CONFIG. Explicitly opt in only when the value intentionally names
+  VM state. Example: KVMAKE_FORWARD_ENV='HTTP_PROXY GOMAXPROCS'
+  ARTIFACTS as an absolute laptop path is remapped to
+  $REMOTE_DIR/_out/artifacts and copied back.
+  KUBECONFIG is copied only if KUBEVIRT_PROVIDER=external.
+  SYNC_OUT, ARTIFACTS, KUBEVIRT_PROVIDER, and KUBECONFIG are also
+  recognized as make assignments (wrapper preprocessing uses them;
+  remapped assignments are passed through).
+  COVERALLS_TOKEN_FILE / FOSSA_TOKEN_FILE are copied into .kvmake-run/
+  as tree-relative paths (visible inside dockerized).
+  DOCKER_CA_CERT_FILE / BAZEL_CACHE_GOOGLE_CREDENTIALS stay absolute
+  (dockerized bind-mounts them).
+
+Container runtimes
+  KUBEVIRT_CRI=podman|docker selects hack/dockerized's runtime; when unset,
+  KubeVirt performs its normal remote-host auto-detection. For example:
+    kvmake KUBEVIRT_CRI=podman bazel-build
+
+  kubevirtci is separate. KUBEVIRTCI_RUNTIME=podman uses its Podman API
+  socket. The upstream default is rootful /run/podman/podman.sock. For a
+  rootless VM setup, put this quoted value in kvmake.conf so expansion occurs
+  on the VM:
+    KUBEVIRTCI_PODMAN_SOCKET='$XDG_RUNTIME_DIR/podman/podman.sock'
+
+  hack/dockerized bind-mounts only $XDG_RUNTIME_DIR/containers/auth.json
+  (Podman CRI) or ~/.docker/config.json without credHelpers (Docker CRI).
+  kvmake materializes inline auths into both of those files from
+  REGISTRY_AUTH_FILE, the runtime auth.json, ~/.config/containers/auth.json,
+  or ~/.docker/config.json. Credential helpers are not usable inside the
+  builder; re-login with REGISTRY_AUTH_FILE=$HOME/.docker/config.json if
+  kvmake warns. Do not put registry credentials in the checkout or
+  .kvmake-run.
+
+kvmake reset [-y]
+  Destructive. Does not wait for other kvmake. On the VM: canonicalize
+  $prefix, require .kvmake-root, delete only children that look like
+  kvmake trees (.kvmake-tree or kubevirt go.mod), stop
+  kv-*-bazel-server and kubevirt-bazel-server, remove volumes kv-*,
+  kubevirt, kubevirt_registry from each reachable Docker/Podman context,
+  including the configured kubevirtci Podman socket. Does not rm -rf an
+  unmatched prefix.
+  Loads ~/.config/kvmake.conf and, if cwd is a KubeVirt tree,
+  bazel-test/kvmake.conf. Prompts unless -y. Does not delete the
+  builder image, Docker/Podman auth files, or leftover
+  ~/.cache/kvmake/locks.
+
+kvmake unlock -y
+  Janitor for leftover sleep/flock holders from older kvmake. fuser -k
+  on ~/.cache/kvmake/locks/*.lock. Fails if fuser is missing on the VM.
+
+Special targets
+  functest / cluster-* / *perftest
+      Run on the VM. Need /dev/kvm. One kubevirtci at a time on the VM.
+  push, bazel-push-images
+      Use the VM's quay login (not the laptop's). kvmake normalizes that
+      login for dockerized; still run podman login once as the same VM user.
+      export DOCKER_PREFIX and DOCKER_TAG before invoking kvmake.
+  vmlog-checker
+      Uses host Go on the VM, not dockerized.
+  builder-*
+      Large image build.
+
+Console
+  If stdin is a TTY, ssh -t so ^C, keystrokes, and window-size changes
+  reach remote make. Do not wrap kvmake in tee if you want a TTY;
+  use script(1) instead.
+
+Rejected make flags: -C / --directory, -f / --file (paths would be local).
+EOF
+}
+
+has_target() {
+	local want=$1 t
+	for t in "${MAKE_TARGETS[@]}"; do
+		if [[ "$t" == "$want" ]]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+needs_cluster_lock() {
+	local t
+	for t in "${MAKE_TARGETS[@]}"; do
+		case "$t" in
+		cluster-* | functest | functest-* | *perftest | conformance | dump)
+			return 0
+			;;
+		esac
+	done
+	return 1
+}
+
+find_kubevirt_root() {
+	local dir
+	dir=$(pwd -P)
+	while [[ -n "$dir" && "$dir" != / ]]; do
+		if [[ -f "$dir/Makefile" && -f "$dir/hack/dockerized" && -f "$dir/go.mod" ]] &&
+			grep -q '^module kubevirt.io/kubevirt$' "$dir/go.mod"; then
+			printf '%s\n' "$dir"
+			return 0
+		fi
+		dir=$(dirname "$dir")
+	done
+	return 1
+}
+
+# Human-readable remote directory name. Docker/Podman: [A-Za-z0-9_.-]+
+workspace_id() {
+	local s=${1#/}
+	s=${s//\//-}
+	s=${s//[^A-Za-z0-9_.-]/-}
+	printf '%s' "$s"
+}
+
+cri_job_name() {
+	local id=$1
+	local name="kv-${id}"
+	# Leave room for "-bazel-server" on the container name.
+	if [[ ${#name} -le 80 ]]; then
+		printf '%s' "$name"
+		return
+	fi
+	local hash
+	hash=$(printf '%s' "$KUBEVIRT_ROOT" | sha256sum | awk '{print substr($1, 1, 12)}')
+	printf 'kv-%s' "$hash"
+}
+
+load_conf_file() {
+	local f=$1
+	[[ -f "$f" ]] || return 0
+	# shellcheck disable=SC1090
+	source "$f"
+}
+
+needs_registry_auth() {
+	local t
+	for t in "${MAKE_TARGETS[@]}"; do
+		case "$t" in
+		push | bazel-push-images)
+			return 0
+			;;
+		esac
+	done
+	return 1
+}
+
+# This runs on the VM, after its profiles have been sourced. Never use the
+# laptop's XDG_RUNTIME_DIR for Podman state or registry credentials.
+ensure_remote_xdg_runtime_dir() {
+	local candidate="/run/user/$(id -u)"
+	if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR}" && -O "${XDG_RUNTIME_DIR}" && -w "${XDG_RUNTIME_DIR}" ]]; then
+		return 0
+	fi
+	if [[ -d "$candidate" && -O "$candidate" && -w "$candidate" ]]; then
+		if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+			echo "kvmake: ignoring unusable XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}; using ${candidate}" >&2
+		fi
+		export XDG_RUNTIME_DIR=$candidate
+		return 0
+	fi
+	echo "kvmake: warning: no usable XDG_RUNTIME_DIR (tried ${XDG_RUNTIME_DIR:-unset} and ${candidate}). Rootless Podman may store login outside hack/dockerized's search path. On the VM: loginctl enable-linger \$USER, then SSH in as that user." >&2
+}
+
+kvmake_json_has_inline_auths() {
+	python3 -c 'import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(1)
+auths = data.get("auths") or {}
+ok = False
+if isinstance(auths, dict):
+    for value in auths.values():
+        if isinstance(value, dict) and (value.get("auth") or value.get("identitytoken") or value.get("identityToken")):
+            ok = True
+        elif isinstance(value, str) and value:
+            ok = True
+raise SystemExit(0 if ok else 1)' "$1"
+}
+
+kvmake_json_has_cred_helpers() {
+	python3 -c 'import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if "credHelpers" in data else 1)' "$1"
+}
+
+# Write auths-only JSON so hack/dockerized will mount ~/.docker/config.json
+# (it skips any file with a credHelpers key) and so Bazel need not exec a helper.
+kvmake_write_auths_only() {
+	local src=$1 dest=$2
+	mkdir -p "$(dirname "$dest")"
+	python3 - "$src" "$dest" <<'PY'
+import json, os, sys
+
+src, dest = sys.argv[1], sys.argv[2]
+with open(src) as fh:
+    data = json.load(fh)
+tmp = dest + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump({"auths": data.get("auths") or {}}, fh)
+    fh.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, dest)
+PY
+}
+
+kvmake_recycle_bazel_server_if_auth_unmounted() {
+	local name="${JOB_NAME:-kubevirt}-bazel-server"
+	local cri="" src=""
+	if command -v podman >/dev/null 2>&1 && podman inspect "$name" >/dev/null 2>&1; then
+		cri=podman
+	elif command -v docker >/dev/null 2>&1 && docker inspect "$name" >/dev/null 2>&1; then
+		cri=docker
+	else
+		return 0
+	fi
+	src=$("$cri" inspect -f '{{range .Mounts}}{{if eq .Destination "/root/.docker/config.json"}}{{.Source}}{{end}}{{end}}' "$name" 2>/dev/null || true)
+	if [[ -n "$src" && -f "$src" ]] && kvmake_json_has_inline_auths "$src"; then
+		return 0
+	fi
+	echo "kvmake: restarting ${name} so hack/dockerized can mount registry credentials" >&2
+	"$cri" stop "$name" >/dev/null || true
+}
+
+# Map host Podman/Docker login files onto the two paths hack/dockerized bind-mounts.
+ensure_remote_registry_auth_for_dockerized() {
+	local src="" cand dest
+	local dests=()
+	local candidates=()
+
+	if ! command -v python3 >/dev/null 2>&1; then
+		echo "kvmake: warning: python3 not found; cannot normalize registry auth for dockerized" >&2
+		return 0
+	fi
+
+	if [[ -n "${REGISTRY_AUTH_FILE:-}" ]]; then
+		candidates+=("$REGISTRY_AUTH_FILE")
+	fi
+	if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+		candidates+=("$XDG_RUNTIME_DIR/containers/auth.json")
+	fi
+	candidates+=("$HOME/.config/containers/auth.json" "$HOME/.docker/config.json")
+
+	for cand in "${candidates[@]}"; do
+		[[ -f "$cand" ]] || continue
+		if kvmake_json_has_inline_auths "$cand"; then
+			src=$cand
+			break
+		fi
+	done
+
+	if [[ -z "$src" ]]; then
+		if [[ "${KVMAKE_NEED_REGISTRY_AUTH:-0}" == "1" ]]; then
+			for cand in "${candidates[@]}"; do
+				[[ -f "$cand" ]] || continue
+				if kvmake_json_has_cred_helpers "$cand"; then
+					echo "kvmake: warning: ${cand} uses credHelpers; Bazel inside dockerized cannot invoke them. Re-login with: REGISTRY_AUTH_FILE=\$HOME/.docker/config.json podman login" >&2
+					return 0
+				fi
+			done
+			echo "kvmake: warning: no inline Docker/Podman registry auths on this VM; make push will be UNAUTHORIZED" >&2
+		fi
+		return 0
+	fi
+
+	if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+		dests+=("$XDG_RUNTIME_DIR/containers/auth.json")
+	fi
+	dests+=("$HOME/.docker/config.json")
+
+	for dest in "${dests[@]}"; do
+		if [[ -f "$dest" ]] && kvmake_json_has_inline_auths "$dest" && ! kvmake_json_has_cred_helpers "$dest"; then
+			continue
+		fi
+		if [[ -f "$dest" ]] && kvmake_json_has_cred_helpers "$dest"; then
+			echo "kvmake: rewriting ${dest} without credHelpers so hack/dockerized will mount it" >&2
+		else
+			echo "kvmake: installing dockerized registry auth at ${dest} (from ${src})" >&2
+		fi
+		if ! kvmake_write_auths_only "$src" "$dest"; then
+			echo "kvmake: warning: failed to write ${dest}" >&2
+		fi
+	done
+
+	if [[ -z "${REGISTRY_AUTH_FILE:-}" && -f "$HOME/.docker/config.json" ]]; then
+		export REGISTRY_AUTH_FILE=$HOME/.docker/config.json
+	fi
+
+	kvmake_recycle_bazel_server_if_auth_unmounted
+}
+
+# kvmake.conf is sourced on the laptop, so quoted remote values may contain an
+# unexpanded XDG_RUNTIME_DIR. Expand only the known runtime-path variables on
+# the VM. This does not read or copy any credential file.
+normalize_remote_runtime_paths() {
+	[[ -n "${XDG_RUNTIME_DIR:-}" ]] || return 0
+	local name value
+	for name in KUBEVIRTCI_PODMAN_SOCKET CONTAINER_HOST REGISTRY_AUTH_FILE DOCKER_HOST; do
+		value=${!name-}
+		[[ -n "$value" ]] || continue
+		value=${value//'${XDG_RUNTIME_DIR}'/$XDG_RUNTIME_DIR}
+		value=${value//'$XDG_RUNTIME_DIR'/$XDG_RUNTIME_DIR}
+		printf -v "$name" '%s' "$value"
+		export "$name"
+	done
+}
+
+remote_environment_prelude() {
+	cat <<'EOF'
+set +e
+[ -r /etc/profile ] && . /etc/profile >/dev/null 2>&1
+[ -r "$HOME/.bash_profile" ] && . "$HOME/.bash_profile" >/dev/null 2>&1
+[ -r "$HOME/.profile" ] && . "$HOME/.profile" >/dev/null 2>&1
+set -e
+EOF
+	declare -f ensure_remote_xdg_runtime_dir
+	printf '%s\n' 'ensure_remote_xdg_runtime_dir'
+}
+
+remote_environment_post_exports() {
+	declare -f kvmake_json_has_inline_auths
+	declare -f kvmake_json_has_cred_helpers
+	declare -f kvmake_write_auths_only
+	declare -f kvmake_recycle_bazel_server_if_auth_unmounted
+	declare -f ensure_remote_registry_auth_for_dockerized
+	declare -f normalize_remote_runtime_paths
+	printf '%s\n' 'normalize_remote_runtime_paths'
+	printf '%s\n' 'ensure_remote_registry_auth_for_dockerized'
+}
+
+blocked_automatic_forward() {
+	case "$1" in
+	DOCKER_AUTH_CONFIG | DOCKER_CERT_PATH | DOCKER_CONFIG | DOCKER_CONTEXT | DOCKER_HOST | DOCKER_TLS | DOCKER_TLS_VERIFY | MAKE | MAKE_COMMAND)
+		return 0
+		;;
+	esac
+	return 1
+}
+
+# Injected into the remote reset script. The command is passed as argv so it
+# also supports a Podman remote client with --url without eval or word-splitting.
+reset_cri_context() {
+	local label=$1
+	shift
+	local containers volumes
+	if ! "$@" ps >/dev/null 2>&1; then
+		return 0
+	fi
+
+	echo "kvmake: cleaning CRI context ${label}"
+	containers=$("$@" ps -a --format '{{.Names}}')
+	while read -r name; do
+		[[ -z "$name" ]] && continue
+		case "$name" in
+		kv-*-bazel-server | kubevirt-bazel-server)
+			echo "kvmake: removing container $name"
+			"$@" rm -f "$name" >/dev/null
+			;;
+		esac
+	done <<<"$containers"
+
+	volumes=$("$@" volume ls -q)
+	while read -r vol; do
+		[[ -z "$vol" ]] && continue
+		case "$vol" in
+		kv-* | kubevirt | kubevirt_registry)
+			echo "kvmake: removing volume $vol"
+			"$@" volume rm -f "$vol" >/dev/null || true
+			;;
+		esac
+	done <<<"$volumes"
+}
+
+ctl_path() {
+	local base=${XDG_RUNTIME_DIR:-/tmp}
+	local key
+	key=$(printf '%s %s' "${KVMAKE_HOST-}" "${KVMAKE_SSH_OPTS-}" | sha256sum | awk '{print substr($1, 1, 16)}')
+	printf '%s/kvmake-ssh-%s-%s' "$base" "$(id -u)" "$key"
+}
+
+ssh_pre_opts() {
+	SSH_PRE_OPTS=(
+		-o ControlMaster=auto
+		-o "ControlPath=$(ctl_path)"
+		-o ControlPersist=120
+		-o StrictHostKeyChecking=accept-new
+	)
+}
+
+ssh_to() {
+	ssh_pre_opts
+	# shellcheck disable=SC2086
+	ssh "${SSH_PRE_OPTS[@]}" $KVMAKE_SSH_OPTS "$KVMAKE_HOST" "$@"
+}
+
+# Dedicated SSH for unlock (no ControlMaster). Mux + background ssh can
+# deadlock; leftover lock holders from older kvmake used a long-lived
+# flock session that must not share the work ControlMaster.
+ssh_lock() {
+	# shellcheck disable=SC2086
+	ssh -n \
+		-o RequestTTY=no \
+		-o ControlMaster=no \
+		-o ControlPath=none \
+		-o StrictHostKeyChecking=accept-new \
+		-o ConnectTimeout=15 \
+		$KVMAKE_SSH_OPTS "$KVMAKE_HOST" "$@"
+}
+
+rsync_ssh() {
+	ssh_pre_opts
+	# shellcheck disable=SC2086
+	rsync -az \
+		-e "ssh ${SSH_PRE_OPTS[*]} $KVMAKE_SSH_OPTS" \
+		"$@"
+}
+
+# Resolve ~ and ~/ against a home directory. Never leave a literal '~'
+# path component: realpath -m '~/foo' from $HOME becomes $HOME/~/foo.
+expand_tilde_prefix() {
+	local prefix=$1
+	local home=$2
+
+	if [[ "$prefix" == \'*\' || "$prefix" == \"*\" ]]; then
+		prefix=${prefix:1:-1}
+	fi
+	case "$prefix" in
+	"~")
+		prefix=$home
+		;;
+	"~/"*)
+		prefix="${home}/${prefix#~/}"
+		;;
+	esac
+	if [[ -n "$home" && "$prefix" == "$home/~/"* ]]; then
+		prefix="${home}/${prefix#"$home"/~/}"
+	fi
+	printf '%s\n' "$prefix"
+}
+
+expand_remote_prefix() {
+	local remote_home
+	remote_home=$(ssh_to 'printf %s "$HOME"')
+	expand_tilde_prefix "$1" "$remote_home"
+}
+
+canonicalize_remote_path() {
+	local prefix=$1
+	local remote_home quoted
+	remote_home=$(ssh_to 'printf %s "$HOME"')
+	prefix=$(expand_tilde_prefix "$prefix" "$remote_home")
+	quoted=$(printf '%q' "$prefix")
+	ssh_to "if command -v realpath >/dev/null 2>&1; then realpath -m ${quoted}; else printf '%s\n' ${quoted}; fi"
+}
+
+remote_lock_dir() {
+	local remote_home
+	remote_home=$(ssh_to 'printf %s "$HOME"')
+	printf '%s/.cache/kvmake/locks' "$remote_home"
+}
+
+parse_make_targets() {
+	local skip_next=0 a
+	MAKE_TARGETS=()
+	for a in "$@"; do
+		if [[ "$skip_next" -eq 1 ]]; then
+			skip_next=0
+			continue
+		fi
+		case "$a" in
+		-C | --directory | -f | --file | --makefile | -I | --include-dir | -o | --old-file | -W | --new-file)
+			skip_next=1
+			;;
+		--directory=* | --file=* | --makefile=* | --include-dir=* | --jobs=* | -j* | -C* | -f*)
+			;;
+		-*)
+			;;
+		*=*)
+			;;
+		*)
+			MAKE_TARGETS+=("$a")
+			;;
+		esac
+	done
+	if [[ ${#MAKE_TARGETS[@]} -eq 0 ]]; then
+		MAKE_TARGETS=(all)
+	fi
+}
+
+# Wrapper-sensitive assignments in make argv win over the environment.
+apply_wrapper_make_assignments() {
+	local a
+	for a in "$@"; do
+		case "$a" in
+		SYNC_OUT=*)
+			SYNC_OUT=${a#SYNC_OUT=}
+			;;
+		ARTIFACTS=*)
+			ARTIFACTS=${a#ARTIFACTS=}
+			;;
+		KUBEVIRT_PROVIDER=*)
+			KUBEVIRT_PROVIDER=${a#KUBEVIRT_PROVIDER=}
+			;;
+		KUBECONFIG=*)
+			KUBECONFIG=${a#KUBECONFIG=}
+			;;
+		esac
+	done
+}
+
+quote_make_args() {
+	local a rewritten=()
+	if [[ $# -eq 0 ]]; then
+		QUOTED_MAKE_ARGS=""
+		return
+	fi
+	for a in "$@"; do
+		case "$a" in
+		ARTIFACTS=/*)
+			rewritten+=("ARTIFACTS=${REMOTE_DIR}/_out/artifacts")
+			;;
+		KUBECONFIG=*)
+			if [[ "${KUBEVIRT_PROVIDER-}" == "external" ]]; then
+				rewritten+=("KUBECONFIG=${REMOTE_DIR}/${REMOTE_SIDECAR}/kubeconfig")
+			else
+				rewritten+=("$a")
+			fi
+			;;
+		*)
+			rewritten+=("$a")
+			;;
+		esac
+	done
+	printf -v QUOTED_MAKE_ARGS '%q ' "${rewritten[@]}"
+}
+
+reject_local_path_flags() {
+	local a
+	for a in "$@"; do
+		case "$a" in
+		-C | -C* | --directory | --directory=*)
+			die "do not pass $a; kvmake always uses the KubeVirt repo root"
+			;;
+		-f | -f* | --file | --file=* | --makefile | --makefile=*)
+			die "do not pass $a; kvmake uses the repo-root Makefile"
+			;;
+		esac
+	done
+}
+
+warn_special_targets() {
+	if has_target vmlog-checker; then
+		echo "kvmake: warning: vmlog-checker uses host Go (not dockerized). The VM needs a Go toolchain." >&2
+	fi
+	if needs_cluster_lock; then
+		echo "kvmake: note: kubevirtci-style target — only one of these at a time on the VM (nodes are named by KUBEVIRT_PROVIDER, not JOB_NAME)." >&2
+	fi
+	local t
+	for t in "${MAKE_TARGETS[@]}"; do
+		case "$t" in
+		builder-*)
+			echo "kvmake: note: builder-build is a large image build." >&2
+			break
+			;;
+		esac
+	done
+}
+
+load_host_config() {
+	local user_host=${KVMAKE_HOST-}
+	local user_dir=${KVMAKE_REMOTE_DIR-}
+	local user_opts=${KVMAKE_SSH_OPTS-}
+	local user_force=${KVMAKE_FORCE_TTY-}
+	local user_skip=${KVMAKE_SKIP_SYNC-}
+	local user_reverse=${KVMAKE_FORCE_REVERSE-}
+	local user_forward=${KVMAKE_FORWARD_ENV-}
+	local root=${1-}
+
+	load_conf_file "${HOME}/.config/kvmake.conf"
+	if [[ -n "$root" ]]; then
+		load_conf_file "${root}/bazel-test/kvmake.conf"
+	fi
+
+	[[ -n "$user_host" ]] && KVMAKE_HOST=$user_host
+	[[ -n "$user_dir" ]] && KVMAKE_REMOTE_DIR=$user_dir
+	[[ -n "$user_opts" ]] && KVMAKE_SSH_OPTS=$user_opts
+	[[ -n "$user_force" ]] && KVMAKE_FORCE_TTY=$user_force
+	[[ -n "$user_skip" ]] && KVMAKE_SKIP_SYNC=$user_skip
+	[[ -n "$user_reverse" ]] && KVMAKE_FORCE_REVERSE=$user_reverse
+	[[ -n "$user_forward" ]] && KVMAKE_FORWARD_ENV=$user_forward
+
+	: "${KVMAKE_REMOTE_DIR:=~/kubevirt}"
+	: "${KVMAKE_SSH_OPTS:=}"
+	: "${KVMAKE_FORCE_TTY:=0}"
+	: "${KVMAKE_SKIP_SYNC:=0}"
+	: "${KVMAKE_FORCE_REVERSE:=0}"
+	: "${KVMAKE_FORWARD_ENV:=}"
+
+	[[ -n "${KVMAKE_HOST-}" ]] ||
+		die "KVMAKE_HOST is unset. export KVMAKE_HOST=user@vm  or put it in ~/.config/kvmake.conf"
+}
+
+ensure_remote_prefix() {
+	local prefix=$1
+	ssh_to "bash -c $(printf '%q' "$(
+		cat <<EOF
+set -e
+prefix=$(printf '%q' "$prefix")
+sentinel=$(printf '%q' "$PREFIX_SENTINEL")
+if [[ -z "\${prefix}" || "\${prefix}" == / || "\${prefix}" == "\${HOME}" || "\${prefix}" == "\${HOME}/" ]]; then
+	echo "kvmake: refusing remote prefix \${prefix}" >&2
+	exit 1
+fi
+if [[ -e "\${prefix}" && ! -d "\${prefix}" ]]; then
+	echo "kvmake: \${prefix} exists and is not a directory" >&2
+	exit 1
+fi
+if [[ -d "\${prefix}" && ! -f "\${prefix}/\${sentinel}" ]]; then
+	if [[ -d "\${prefix}/.locks" || -f "\${prefix}/.cluster.lock" ]]; then
+		printf 'kvmake\n' > "\${prefix}/\${sentinel}"
+	elif [[ -n "\$(ls -A "\${prefix}" 2>/dev/null)" ]]; then
+		echo "kvmake: \${prefix} exists without \${sentinel}; refusing to use a non-kvmake directory" >&2
+		exit 1
+	fi
+fi
+mkdir -p "\${prefix}"
+if [[ ! -f "\${prefix}/\${sentinel}" ]]; then
+	printf 'kvmake\n' > "\${prefix}/\${sentinel}"
+fi
+EOF
+	)")"
+}
+
+do_unlock() {
+	local yes=${1-0}
+	local root="" lock_dir
+
+	command -v ssh >/dev/null || die "ssh is required on this machine"
+	[[ "$yes" == "1" ]] || die "unlock can kill a live kvmake; pass: kvmake unlock -y"
+	root=$(find_kubevirt_root || true)
+	load_host_config "$root"
+	lock_dir=$(remote_lock_dir)
+
+	echo "kvmake: killing leftover flock holders from older kvmake in ${lock_dir} on ${KVMAKE_HOST}" >&2
+	ssh_lock "command -v fuser >/dev/null" ||
+		die "fuser is not installed on ${KVMAKE_HOST}; cannot unlock"
+	ssh_lock "bash -c $(printf '%q' "$(
+		cat <<EOF
+set +e
+dir=$(printf '%q' "$lock_dir")
+shopt -s nullglob
+for f in "\$dir"/*.lock; do
+	echo "kvmake: fuser -k \$f"
+	fuser -k "\$f" >/dev/null 2>&1
+done
+rm -f "\$dir"/*.ready.*
+echo "kvmake: unlock complete"
+EOF
+	)")"
+}
+
+do_reset() {
+	local yes=${1-0}
+	local prefix root="" prelude post_exports reset_cri_function
+	local reset_export_block="" name extra
+	local reset_export_names=(KUBEVIRTCI_PODMAN_SOCKET)
+
+	command -v ssh >/dev/null || die "ssh is required on this machine"
+	root=$(find_kubevirt_root || true)
+	load_host_config "$root"
+	prefix=$(canonicalize_remote_path "$KVMAKE_REMOTE_DIR")
+
+	echo "kvmake: will purge on ${KVMAKE_HOST}:" >&2
+	echo "  trees:   kvmake children under ${prefix}" >&2
+	echo "  CRI:     kv-*-bazel-server, kubevirt-bazel-server" >&2
+	echo "  volumes: kv-*, kubevirt, kubevirt_registry" >&2
+
+	if [[ "$yes" != "1" ]]; then
+		if [[ ! -t 0 ]]; then
+			die "non-interactive reset requires: kvmake reset -y"
+		fi
+		local reply
+		read -r -p "kvmake: proceed? [y/N] " reply
+		[[ "$reply" == "y" || "$reply" == "Y" ]] || die "aborted"
+	fi
+
+	# KUBEVIRTCI_PODMAN_SOCKET is normally auto-forwarded. Client connection
+	# settings are included only when the user explicitly named them.
+	# shellcheck disable=SC2086
+	for extra in ${KVMAKE_FORWARD_ENV}; do
+		case "$extra" in
+		CONTAINER_CONNECTION | CONTAINER_HOST | DOCKER_CERT_PATH | DOCKER_CONTEXT | DOCKER_HOST | DOCKER_TLS | DOCKER_TLS_VERIFY | XDG_RUNTIME_DIR)
+			reset_export_names+=("$extra")
+			;;
+		esac
+	done
+	for name in "${reset_export_names[@]}"; do
+		if [[ -n "${!name-}" ]]; then
+			reset_export_block+="export $(printf '%q' "${name}=${!name}")"$'\n'
+		fi
+	done
+	prelude=$(remote_environment_prelude)
+	post_exports=$(remote_environment_post_exports)
+	reset_cri_function=$(declare -f reset_cri_context)
+
+	ssh_to "bash -c $(printf '%q' "$(
+			cat <<EOF
+set -e
+${prelude}
+${reset_export_block}
+${post_exports}
+${reset_cri_function}
+prefix=$(printf '%q' "$prefix")
+sentinel=$(printf '%q' "$PREFIX_SENTINEL")
+tree_sentinel=$(printf '%q' "$TREE_SENTINEL")
+if command -v realpath >/dev/null 2>&1; then
+	prefix=\$(realpath -m "\${prefix}")
+fi
+if [[ -z "\${prefix}" || "\${prefix}" == / || "\${prefix}" == "\${HOME}" || "\${prefix}" == "\${HOME}/" ]]; then
+	echo "kvmake: refusing to purge \${prefix}" >&2
+	exit 1
+fi
+if [[ ! -f "\${prefix}/\${sentinel}" ]]; then
+	echo "kvmake: refusing to purge \${prefix}: missing \${sentinel}" >&2
+	exit 1
+fi
+shopt -s nullglob
+for d in "\${prefix}"/*; do
+	[[ -d "\$d" ]] || continue
+	if [[ -f "\$d/\${tree_sentinel}" ]]; then
+		echo "kvmake: removing \$d"
+		rm -rf "\$d"
+		continue
+	fi
+	if [[ -f "\$d/go.mod" ]] && grep -q '^module kubevirt.io/kubevirt\$' "\$d/go.mod"; then
+		echo "kvmake: removing \$d"
+		rm -rf "\$d"
+	fi
+done
+rm -rf "\${prefix}/.locks" "\${prefix}/.cluster.lock"
+
+reset_cri_context podman podman
+reset_cri_context docker docker
+
+podman_socket="\${KUBEVIRTCI_PODMAN_SOCKET:-/run/podman/podman.sock}"
+if [[ -S "\$podman_socket" ]]; then
+	reset_cri_context "kubevirtci-podman:\$podman_socket" \
+		podman --remote "--url=unix://\$podman_socket"
+fi
+EOF
+	)")"
+	echo "kvmake: reset complete" >&2
+}
+
+sync_to_remote() {
+	ssh_to "mkdir -p $(printf '%q' "$REMOTE_DIR")"
+	echo "kvmake: sync → ${KVMAKE_HOST}:${REMOTE_DIR}" >&2
+	rsync_ssh --delete \
+		"${RSYNC_EXCLUDES[@]}" \
+		"${KUBEVIRT_ROOT}/" \
+		"${KVMAKE_HOST}:${REMOTE_DIR}/"
+	ssh_to "printf 'kvmake\n' > $(printf '%q' "${REMOTE_DIR}/${TREE_SENTINEL}")"
+}
+
+copy_file_var() {
+	local var=$1
+	local mode=$2
+	local src=${!var-}
+	[[ -n "$src" ]] || return 0
+	if [[ ! -f "$src" ]]; then
+		die "$var=$src is not a file"
+	fi
+	ssh_to "mkdir -p $(printf '%q' "${REMOTE_DIR}/${REMOTE_SIDECAR}")"
+	rsync_ssh "$src" "${KVMAKE_HOST}:${REMOTE_DIR}/${REMOTE_SIDECAR}/${var}"
+	if [[ "$mode" == rel ]]; then
+		REMOTE_EXPORTS+=("${var}=${REMOTE_SIDECAR}/${var}")
+	else
+		REMOTE_EXPORTS+=("${var}=${REMOTE_DIR}/${REMOTE_SIDECAR}/${var}")
+	fi
+}
+
+copy_kubeconfig_if_external() {
+	local src=${KUBECONFIG-}
+	[[ "${KUBEVIRT_PROVIDER-}" == "external" ]] || return 0
+	[[ -n "$src" ]] || die "KUBEVIRT_PROVIDER=external requires KUBECONFIG"
+	src=${src%%:*}
+	[[ -f "$src" ]] || die "KUBECONFIG=$src is not a file"
+	ssh_to "mkdir -p $(printf '%q' "${REMOTE_DIR}/${REMOTE_SIDECAR}")"
+	rsync_ssh "$src" "${KVMAKE_HOST}:${REMOTE_DIR}/${REMOTE_SIDECAR}/kubeconfig"
+	REMOTE_EXPORTS+=("KUBECONFIG=${REMOTE_DIR}/${REMOTE_SIDECAR}/kubeconfig")
+}
+
+remap_artifacts() {
+	local src=${ARTIFACTS-}
+	[[ -n "$src" ]] || return 0
+	if [[ "$src" == /* ]]; then
+		ARTIFACTS_LOCAL=$src
+		REMOTE_EXPORTS+=("ARTIFACTS=${REMOTE_DIR}/_out/artifacts")
+	else
+		REMOTE_EXPORTS+=("ARTIFACTS=${src}")
+	fi
+}
+
+# Host-side stamps (non-dockerized make). Bazel stamping still needs
+# a real .git on the VM; see assert_git_dir_for_remote.
+load_kubevirt_git_vars() {
+	local here=$PWD
+	cd "$KUBEVIRT_ROOT"
+	KUBEVIRT_DIR=$KUBEVIRT_ROOT
+	# shellcheck disable=SC1091
+	source ./hack/version.sh
+	kubevirt::version::get_version_vars
+	if [[ -z ${KUBEVIRT_SOURCE_DATE_EPOCH-} ]]; then
+		KUBEVIRT_SOURCE_DATE_EPOCH=$(git show -s --format=format:%ct HEAD 2>/dev/null || true)
+	fi
+	if [[ -z ${KUBEVIRT_VERSION-} ]]; then
+		KUBEVIRT_VERSION=$(git describe --always --tags 2>/dev/null || true)
+	fi
+	cd "$here"
+}
+
+assert_git_dir_for_remote() {
+	if [[ -d "$KUBEVIRT_ROOT/.git" ]]; then
+		return 0
+	fi
+	if [[ -f "$KUBEVIRT_ROOT/.git" ]]; then
+		die "this checkout is a git worktree (.git is a file). kvmake copies .git to the VM for Bazel stamping; use a normal clone."
+	fi
+	die "no .git directory; Bazel workspace_status on the VM cannot stamp without it"
+}
+
+append_if_set() {
+	local name=$1
+	local mode=${2:-automatic}
+	case "$name" in
+	JOB_NAME | KUBECONFIG | ARTIFACTS | KUBEVIRT_ROOT | KUBEVIRT_DIR | BAZEL_CACHE_GOOGLE_CREDENTIALS | DOCKER_CA_CERT_FILE | COVERALLS_TOKEN_FILE | FOSSA_TOKEN_FILE)
+		return 0
+		;;
+	esac
+	if [[ "$mode" == automatic ]] && blocked_automatic_forward "$name"; then
+		return 0
+	fi
+	if [[ -n "${!name-}" ]]; then
+		REMOTE_EXPORTS+=("${name}=${!name}")
+	fi
+}
+
+# Ask GNU Make for its parsed database, then extract simple variable references
+# from recipes and definitions. A clean environment keeps unrelated exported
+# variables and their values out of the database.
+discover_make_environment_names() {
+	local database status
+	set +e
+	database=$(
+		cd "$KUBEVIRT_ROOT" &&
+			env -i HOME="$HOME" PATH="$PATH" LC_ALL=C \
+				make --no-print-directory -pRrq
+	)
+	status=$?
+	set -e
+	if [[ "$status" -gt 1 ]]; then
+		die "failed to inspect KubeVirt's GNU Make database (status ${status})"
+	fi
+
+	mapfile -t MAKE_ENV_NAMES < <(
+		printf '%s\n' "$database" | awk '
+		{
+			line = $0
+			while (match(line, /\$\([A-Za-z_][A-Za-z0-9_]*\)|\$\{[A-Za-z_][A-Za-z0-9_]*\}/)) {
+				ref = substr(line, RSTART, RLENGTH)
+				print substr(ref, 3, length(ref) - 3)
+				line = substr(line, RSTART + RLENGTH)
+			}
+		}' | sort -u
+	)
+}
+
+build_remote_exports() {
+	local name extra
+	local -A exported=()
+	REMOTE_EXPORTS=()
+	discover_make_environment_names
+	while IFS= read -r name; do
+		[[ -n "$name" ]] && exported["$name"]=1
+	done < <(compgen -e)
+	for name in "${MAKE_ENV_NAMES[@]}"; do
+		[[ -n "${exported[$name]+x}" ]] && append_if_set "$name"
+	done
+	for name in $(compgen -v KUBEVIRT_ || true) $(compgen -v DOCKER_ || true) \
+		$(compgen -v QUAY_ || true) $(compgen -v FUNC_TEST_ || true) \
+		$(compgen -v KUBEVIRTCI_ || true); do
+		append_if_set "$name"
+	done
+	# shellcheck disable=SC2086
+	for extra in ${KVMAKE_FORWARD_ENV}; do
+		[[ -n "$extra" ]] && append_if_set "$extra" explicit
+	done
+	for name in "${ABS_FILE_VARS[@]}"; do
+		copy_file_var "$name" abs
+	done
+	for name in "${TREE_FILE_VARS[@]}"; do
+		copy_file_var "$name" rel
+	done
+	copy_kubeconfig_if_external
+	remap_artifacts
+	REMOTE_EXPORTS+=("JOB_NAME=${TREE_JOB_NAME}")
+	if needs_registry_auth; then
+		REMOTE_EXPORTS+=("KVMAKE_NEED_REGISTRY_AUTH=1")
+	fi
+}
+
+local_edits_since() {
+	local stamp=$1
+	local root=$2
+	find "$root" \( \
+		-path "$root/.git" -o \
+		-path "$root/.idea" -o \
+		-path "$root/.cursor" -o \
+		-path "$root/.claude" -o \
+		-path "$root/.vscode" -o \
+		-path "$root/.history" -o \
+		-path "$root/bazel-bin" -o \
+		-path "$root/bazel-genfiles" -o \
+		-path "$root/bazel-kubevirt" -o \
+		-path "$root/bazel-out" -o \
+		-path "$root/bazel-testlogs" -o \
+		-path "$root/_out" -o \
+		-path "$root/.vagrant" -o \
+		-path "$root/.bazeldnf" -o \
+		-path "$root/_ci-configs" -o \
+		-path "$root/${REMOTE_SIDECAR}" -o \
+		-path "$root/bazel-test" \
+		\) -prune -o -type f -newer "$stamp" \
+		! -name '.kubectl' ! -name '.oc' ! -name '.kubeconfig' \
+		-print
+}
+
+assert_no_local_edits() {
+	local files
+	files=$(local_edits_since "$FORWARD_STAMP" "$KUBEVIRT_ROOT" || true)
+	if [[ -z "$files" ]]; then
+		return 0
+	fi
+	echo "kvmake: refusing reverse-sync: laptop files changed after forward rsync:" >&2
+	printf '%s\n' "$files" >&2
+	echo "kvmake: do not edit the checkout while kvmake is running, or set KVMAKE_FORCE_REVERSE=1" >&2
+	return 1
+}
+
+assert_remote_tree() {
+	local mod
+	mod=$(ssh_to "head -n 1 $(printf '%q' "${REMOTE_DIR}/go.mod") 2>/dev/null" || true)
+	if [[ "$mod" != "module kubevirt.io/kubevirt" ]]; then
+		echo "kvmake: refusing reverse-sync: ${KVMAKE_HOST}:${REMOTE_DIR}/go.mod is not kubevirt.io/kubevirt (got: ${mod:-empty})" >&2
+		return 1
+	fi
+	return 0
+}
+
+sync_artifacts_from_remote() {
+	if [[ -z "${ARTIFACTS_LOCAL-}" ]]; then
+		return 0
+	fi
+	if ! ssh_to "test -d $(printf '%q' "${REMOTE_DIR}/_out/artifacts")"; then
+		return 0
+	fi
+	mkdir -p "$ARTIFACTS_LOCAL"
+	rsync_ssh --delete \
+		"${KVMAKE_HOST}:${REMOTE_DIR}/_out/artifacts/" \
+		"${ARTIFACTS_LOCAL}/"
+}
+
+sync_from_remote() {
+	echo "kvmake: sync ← ${KVMAKE_HOST}:${REMOTE_DIR}" >&2
+	assert_remote_tree || return 1
+
+	if [[ "${KVMAKE_FORCE_REVERSE:-0}" != "1" && -n "${FORWARD_STAMP-}" ]]; then
+		assert_no_local_edits || return 1
+	fi
+
+	rsync_ssh --delete \
+		--exclude=.git \
+		"${RSYNC_EXCLUDES[@]}" \
+		"${KVMAKE_HOST}:${REMOTE_DIR}/" \
+		"${KUBEVIRT_ROOT}/"
+
+	if [[ "${DO_SYNC_OUT}" == "1" ]] &&
+		ssh_to "test -d $(printf '%q' "${REMOTE_DIR}/_out")"; then
+		mkdir -p "${KUBEVIRT_ROOT}/_out"
+		rsync_ssh --delete \
+			"${KVMAKE_HOST}:${REMOTE_DIR}/_out/" \
+			"${KUBEVIRT_ROOT}/_out/"
+	fi
+	sync_artifacts_from_remote
+	NEED_SYNC_FROM=0
+}
+
+run_remote_make() {
+	local export_block="" item quoted_script prelude post_exports
+	local ssh_tty=()
+
+	for item in "${REMOTE_EXPORTS[@]}"; do
+		export_block+="export $(printf '%q' "$item")"$'\n'
+	done
+	prelude=$(remote_environment_prelude)
+	post_exports=$(remote_environment_post_exports)
+
+	quoted_script=$(printf '%q' "$(
+			cat <<EOF
+set -e
+${prelude}
+cd $(printf '%q' "$REMOTE_DIR")
+${export_block}
+${post_exports}
+if ! command -v make >/dev/null; then
+	echo "kvmake: make not found on the VM (PATH=\$PATH). Install make or add it to the non-interactive SSH PATH." >&2
+	exit 127
+fi
+exec make ${QUOTED_MAKE_ARGS}
+EOF
+	)")
+
+	if [[ "${KVMAKE_FORCE_TTY:-0}" == "1" ]]; then
+		ssh_tty=(-tt)
+	elif [[ -t 0 ]]; then
+		ssh_tty=(-t)
+	fi
+
+	ssh_pre_opts
+	# shellcheck disable=SC2086,SC2029
+	ssh "${SSH_PRE_OPTS[@]}" "${ssh_tty[@]}" $KVMAKE_SSH_OPTS \
+		"$KVMAKE_HOST" "bash -c ${quoted_script}"
+}
+
+run_local_generate_verify() {
+	if ! has_target generate-verify; then
+		return 0
+	fi
+	echo "kvmake: running generate-verify git check locally" >&2
+	(cd "$KUBEVIRT_ROOT" && ./hack/verify-generate.sh)
+}
+
+cleanup() {
+	if [[ "$NEED_SYNC_FROM" == "1" ]]; then
+		sync_from_remote || echo "kvmake: reverse-sync after interrupt failed" >&2
+	fi
+	if [[ -n "${FORWARD_STAMP-}" ]]; then
+		rm -f "$FORWARD_STAMP"
+	fi
+}
+
+main() {
+	if [[ "${1-}" == "-h" || "${1-}" == "--help" ]]; then
+		usage
+		exit 0
+	fi
+
+	if [[ "${1-}" == "unlock" ]]; then
+		local yes=0
+		if [[ "${2-}" == "-y" || "${2-}" == "--yes" ]]; then
+			yes=1
+		fi
+		do_unlock "$yes"
+		exit 0
+	fi
+
+	if [[ "${1-}" == "reset" ]]; then
+		local yes=0
+		if [[ "${2-}" == "-y" || "${2-}" == "--yes" ]]; then
+			yes=1
+		fi
+		do_reset "$yes"
+		exit 0
+	fi
+
+	command -v rsync >/dev/null || die "rsync is required on this machine"
+	command -v ssh >/dev/null || die "ssh is required on this machine"
+	command -v make >/dev/null || die "GNU make is required on this machine"
+
+	KUBEVIRT_ROOT=$(find_kubevirt_root) ||
+		die "working directory is not a KubeVirt checkout (walked up from $(pwd) and found no kubevirt.io/kubevirt go.mod + hack/dockerized)"
+
+	load_host_config "$KUBEVIRT_ROOT"
+
+	TREE_ID=$(workspace_id "$KUBEVIRT_ROOT")
+	TREE_JOB_NAME=$(cri_job_name "$TREE_ID")
+	REMOTE_PREFIX=$(canonicalize_remote_path "$KVMAKE_REMOTE_DIR")
+	REMOTE_DIR="${REMOTE_PREFIX}/${TREE_ID}"
+
+	load_kubevirt_git_vars
+	assert_git_dir_for_remote
+
+	reject_local_path_flags "$@"
+	parse_make_targets "$@"
+	apply_wrapper_make_assignments "$@"
+	warn_special_targets
+
+	echo "kvmake: workspace id ${TREE_ID}" >&2
+	echo "kvmake: remote tree ${KVMAKE_HOST}:${REMOTE_DIR}" >&2
+	echo "kvmake: JOB_NAME=${TREE_JOB_NAME}" >&2
+
+	DO_SYNC_OUT=1
+	[[ "${SYNC_OUT-}" == "false" ]] && DO_SYNC_OUT=0
+
+	trap cleanup EXIT
+	ensure_remote_prefix "$REMOTE_PREFIX"
+
+	ARTIFACTS_LOCAL=
+	build_remote_exports
+	quote_make_args "$@"
+
+	if [[ "$KVMAKE_SKIP_SYNC" != "1" ]]; then
+		FORWARD_STAMP=$(mktemp)
+		sync_to_remote
+	fi
+
+	NEED_SYNC_FROM=1
+	local make_status=0 sync_status=0
+	run_remote_make || make_status=$?
+	sync_from_remote || sync_status=$?
+	# Main already attempted reverse-sync. Leave retry for interrupt only.
+	NEED_SYNC_FROM=0
+	if [[ "$sync_status" -eq 0 && "$make_status" -eq 0 ]]; then
+		run_local_generate_verify || make_status=$?
+	fi
+	if [[ "$make_status" -ne 0 ]]; then
+		if [[ "$sync_status" -ne 0 ]]; then
+			echo "kvmake: reverse-sync failed (status ${sync_status}) after make failed (status ${make_status})" >&2
+		fi
+		exit "$make_status"
+	fi
+	exit "$sync_status"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+	main "$@"
+fi
